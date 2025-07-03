@@ -8,7 +8,8 @@ A fast FEN-based Stockfish position analyzer with instant win‐probability disp
 
 All the usual features remain: reset, best-move preview, click-to-move, board flip.
 
-![App Screenshot](images/screenshot.png)
+![image](https://github.com/user-attachments/assets/b508fe2b-bffe-447a-8274-793c345f8ffe)
+
 
 ---
 
