@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Chess-in-a-flash — Coach for exactly TWO systems:
-  • Colle (White)
-  • KID (Black)
+Stockfish FEN analyser + Coach (Colle / KID)
+- Pick your color: White→Colle, Black→KID
+- Coach suggests only for your color on your turns (opening script)
+- Orientation is fixed to your chosen color (you can flip if you want)
 
 Install:
     python -m pip install python-chess pillow cairosvg
@@ -15,11 +16,12 @@ from tkinter import ttk, messagebox
 from PIL import Image, ImageTk
 import chess, chess.engine, chess.svg, cairosvg
 
+# ---------- Config ----------
 DEPTH = 18
 BOARD_SIZE = 320
 SQUARE = BOARD_SIZE // 8
 
-# logistic curve constant — 75% win chance ~ +300 cp
+# Win% curve: ~+300cp ≈ 75%
 K_LOG = 0.004
 
 
@@ -36,7 +38,7 @@ def score_cp_signed(info_score: chess.engine.PovScore, pov_is_white: bool) -> in
     sc = info_score.pov(pov)
     if sc.is_mate():
         m = sc.mate()
-        return 100000 if (m is not None and m > 0) else -100000
+        return 100000 if (m and m > 0) else -100000
     cp = sc.score(mate_score=100000)
     return int(cp if cp is not None else 0)
 
@@ -54,10 +56,8 @@ def find_stockfish_path() -> Optional[str]:
     return None
 
 
-# -------------------------- Coach logic --------------------------
-
+# ---------- Coach logic (only Colle & KID) ----------
 def _try_san(board: chess.Board, san_list: List[str]) -> Optional[chess.Move]:
-    """Return first legal move that matches any SAN in the list."""
     for san in san_list:
         try:
             mv = board.parse_san(san)
@@ -70,8 +70,8 @@ def _try_san(board: chess.Board, san_list: List[str]) -> Optional[chess.Move]:
 
 def suggest_colle(board: chess.Board) -> Optional[chess.Move]:
     """
-    Colle policy (White):
-      d4, Nf3, e3, Bd3, O-O, Nbd2, c3, Re1, then e4; else c4 if e4 is clamped.
+    Colle script (White): d4, Nf3, e3, Bd3, O-O, Nbd2, c3, Re1, then e4; else c4.
+    Stops if out of book.
     """
     if board.turn != chess.WHITE:
         return None
@@ -87,8 +87,8 @@ def suggest_colle(board: chess.Board) -> Optional[chess.Move]:
 
 def suggest_kid_black(board: chess.Board) -> Optional[chess.Move]:
     """
-    KID shell (Black) used against anything:
-      Nf6, g6, Bg7, d6, O-O, then e5/c5/f5 depending on position.
+    KID shell (Black) vs anything: Nf6, g6, Bg7, d6, O-O, then e5/c5/f5.
+    Stops if out of book.
     """
     if board.turn != chess.BLACK:
         return None
@@ -99,43 +99,50 @@ def suggest_kid_black(board: chess.Board) -> Optional[chess.Move]:
     return _try_san(board, follow)
 
 
-# -------------------------- GUI App ------------------------------
-
+# ---------- GUI ----------
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Stockfish FEN analyser + Coach (Colle / KID)")
-        self.geometry("900x690")
+        self.geometry("900x720")
         self.resizable(False, False)
 
-        # -------- FEN input ---------------------------------------
+        # FEN input
         ttk.Label(self, text="Paste a FEN string:").pack(anchor="w", padx=10, pady=(10, 2))
         self.fen_var = tk.StringVar()
         fen_ent = ttk.Entry(self, textvariable=self.fen_var, width=120)
         fen_ent.pack(padx=10, fill="x")
         fen_ent.bind("<Return>", lambda _ : self.load_fen())
 
-        # -------- Coach controls ----------------------------------
+        # Coach controls
         ctl = ttk.Frame(self); ctl.pack(anchor="w", padx=10, pady=(6, 0))
         self.coach_on = tk.BooleanVar(value=True)
         ttk.Checkbutton(ctl, text="Coach mode", variable=self.coach_on,
-                        command=self.refresh_view).pack(side="left", padx=(0, 10))
+                        command=self.redraw).pack(side="left", padx=(0, 10))
 
         ttk.Label(ctl, text="System:").pack(side="left")
-        self.system_var = tk.StringVar(value="KID (Black)")
-        systems = ["Colle (White)", "KID (Black)"]  # only two choices
-        ttk.Combobox(ctl, textvariable=self.system_var, values=systems, state="readonly",
-                     width=18).pack(side="left", padx=(4, 12))
+        self.system_var = tk.StringVar(value="Colle (White)")
+        systems = ["Colle (White)", "KID (Black)"]
+        ttk.Combobox(ctl, textvariable=self.system_var, values=systems,
+                     state="readonly", width=18).pack(side="left", padx=(4, 12))
 
-        # -------- side selector (board orientation only) ----------
-        self.side_var = tk.StringVar(value="auto")
-        side_fr = ttk.Frame(self); side_fr.pack(anchor="w", padx=10, pady=(6, 0))
-        ttk.Label(side_fr, text="I am: ").pack(side="left")
-        for txt, val in (("Auto (use FEN)", "auto"), ("White", "white"), ("Black", "black")):
-            ttk.Radiobutton(side_fr, text=txt, value=val, variable=self.side_var,
-                            command=self.refresh_view).pack(side="left")
+        # I'm playing as (sets system + orientation)
+        play_fr = ttk.Frame(self); play_fr.pack(anchor="w", padx=10, pady=(6, 0))
+        ttk.Label(play_fr, text="I'm playing as:").pack(side="left")
+        self.play_color = tk.StringVar(value="white")
+        ttk.Radiobutton(play_fr, text="White", value="white",
+                        variable=self.play_color, command=self.on_pick_color).pack(side="left")
+        ttk.Radiobutton(play_fr, text="Black", value="black",
+                        variable=self.play_color, command=self.on_pick_color).pack(side="left")
 
-        # -------- buttons -----------------------------------------
+        # Orientation options
+        opt_fr = ttk.Frame(self); opt_fr.pack(anchor="w", padx=10, pady=(0, 4))
+        self.follow_turn = tk.BooleanVar(value=False)  # fixed by default
+        ttk.Checkbutton(opt_fr, text="Flip with side to move",
+                        variable=self.follow_turn, command=self.redraw).pack(side="left", padx=(0, 10))
+        ttk.Button(opt_fr, text="Flip now", command=self.flip_once).pack(side="left")
+
+        # Buttons
         btn_fr = ttk.Frame(self); btn_fr.pack(pady=8)
         ttk.Button(btn_fr, text="Load FEN", command=self.load_fen).grid(row=0, column=0, padx=5)
         ttk.Button(btn_fr, text="Reset",    command=self.reset_pos).grid(row=0, column=1, padx=5)
@@ -146,22 +153,22 @@ class App(tk.Tk):
         ttk.Entry(btn_fr, width=12, textvariable=self.move_var).grid(row=0, column=4)
         ttk.Button(btn_fr, text="Evaluate", command=self.eval_san).grid(row=0, column=5, padx=5)
 
-        # -------- eval label --------------------------------------
+        # Eval label
         self.eval_lbl = ttk.Label(self, text="", font=("Courier New", 12))
         self.eval_lbl.pack(pady=6)
 
-        # -------- board canvas ------------------------------------
+        # Board canvas
         self.canvas = tk.Canvas(self, width=BOARD_SIZE, height=BOARD_SIZE, highlightthickness=0)
         self.canvas.pack()
         self.canvas.bind("<Button-1>", self.on_click)
         self._img = None
         self._sel = None
 
-        # -------- status bar --------------------------------------
+        # Status bar
         self.status = ttk.Label(self, text="", relief="sunken", anchor="w")
         self.status.pack(side="bottom", fill="x")
 
-        # -------- engine ------------------------------------------
+        # Engine
         path = find_stockfish_path()
         if not path:
             messagebox.showerror("Engine not found",
@@ -170,48 +177,56 @@ class App(tk.Tk):
             self.destroy(); return
         try:
             self.engine = chess.engine.SimpleEngine.popen_uci(path)
-            self.engine.configure({
-                "Threads": max(1, os.cpu_count() // 2),
-                "Hash": 256
-            })
+            self.engine.configure({"Threads": max(1, os.cpu_count() // 2), "Hash": 256})
         except Exception as e:
             messagebox.showerror("Engine error", f"Failed to start Stockfish at:\n{path}\n\n{e}")
             self.destroy(); return
 
-        # internal board
+        # Internal board
         self.board = chess.Board()
         self.base_fen = self.board.fen()
+        self.fixed_bottom_is_white = True  # honored when follow_turn is False
+
+        # Apply initial color selection (White)
+        self.on_pick_color()
+
         self.redraw()
         self.async_eval()
 
-    # ===== basics =================================================
-    def my_side(self, turn):
-        sel = self.side_var.get()
-        if sel == "white": return chess.WHITE
-        if sel == "black": return chess.BLACK
-        return turn  # auto: orient to side to move
+    # ---------- Orientation helpers ----------
+    def bottom_color(self) -> chess.Color:
+        return (self.board.turn if self.follow_turn.get()
+                else (chess.WHITE if self.fixed_bottom_is_white else chess.BLACK))
 
-    def show_eval(self, cp_signed: int):
-        my_prob = win_prob(cp_signed)
-        opp_prob = 100.0 - my_prob
-        self.eval_lbl.config(
-            text=f"Eval: {fmt_cp(cp_signed)}  |  Win% Me:{my_prob:.0f} – Opp:{opp_prob:.0f}  (d{DEPTH})"
-        )
+    def flip_once(self):
+        if self.follow_turn.get():
+            self.follow_turn.set(False)
+        self.fixed_bottom_is_white = not self.fixed_bottom_is_white
+        self.redraw()
 
-    # ===== coach suggestion (only on YOUR turn, only for chosen system) ==
+    # ---------- Color/system selection ----------
+    def on_pick_color(self):
+        color = self.play_color.get()
+        # set system automatically
+        self.system_var.set("Colle (White)" if color == "white" else "KID (Black)")
+        # fix orientation to your color
+        self.follow_turn.set(False)
+        self.fixed_bottom_is_white = (color == "white")
+        self.redraw()
+
+    # ---------- Coach ----------
     def coach_move(self) -> Optional[chess.Move]:
         if not self.coach_on.get():
             return None
-
         sys_name = self.system_var.get()
         if self.board.turn == chess.WHITE and sys_name == "Colle (White)":
             return suggest_colle(self.board)
         if self.board.turn == chess.BLACK and sys_name == "KID (Black)":
             return suggest_kid_black(self.board)
-        return None  # wrong colour for selected system → no arrow
+        return None
 
-    # ===== drawing ===============================================
-    def redraw(self, board=None, highlight=None):
+    # ---------- Drawing ----------
+    def redraw(self, board: Optional[chess.Board] = None, highlight: Optional[chess.Move] = None):
         if board is None:
             board = self.board
 
@@ -225,14 +240,14 @@ class App(tk.Tk):
         svg = chess.svg.board(
             board=board,
             size=BOARD_SIZE,
-            orientation=self.my_side(board.turn),
+            orientation=self.bottom_color(),
             arrows=arrows
         )
         png = cairosvg.svg2png(bytestring=svg.encode())
         self._img = ImageTk.PhotoImage(Image.open(io.BytesIO(png)))
         self.canvas.create_image(0, 0, image=self._img, anchor="nw")
 
-    # ===== engine evaluation pipeline ============================
+    # ---------- Engine eval ----------
     def async_eval(self):
         self.status.config(text="Thinking…")
         threading.Thread(target=self._worker_eval, daemon=True).start()
@@ -242,13 +257,21 @@ class App(tk.Tk):
         self.after(0, self._finish_eval, info)
 
     def _finish_eval(self, info):
-        pov_is_white = (self.my_side(self.board.turn ^ 1) == chess.WHITE)
+        # side that just moved
+        pov_is_white = (self.board.turn == chess.BLACK)
         cp = score_cp_signed(info["score"], pov_is_white)
         self.show_eval(cp)
         self.status.config(text="Ready")
-        self.redraw()  # update suggestion for the new side to move
+        self.redraw()
 
-    # ===== UI actions ============================================
+    def show_eval(self, cp_signed: int):
+        my_prob = win_prob(cp_signed)
+        opp_prob = 100.0 - my_prob
+        self.eval_lbl.config(
+            text=f"Eval: {fmt_cp(cp_signed)}  |  Win% Me:{my_prob:.0f} – Opp:{opp_prob:.0f}  (d{DEPTH})"
+        )
+
+    # ---------- UI actions ----------
     def load_fen(self):
         fen = self.fen_var.get().strip()
         if not fen:
@@ -268,20 +291,15 @@ class App(tk.Tk):
         self.redraw()
         self.async_eval()
 
-    def refresh_view(self):
-        self.redraw()
-        self.async_eval()
-
-    # ===== click-to-move (respects orientation) ==================
+    # ---------- Click-to-move (mapped to current orientation) ----------
     def on_click(self, event):
-        # Map mouse to square based on current board orientation (who is at bottom now)
-        orient = self.my_side(self.board.turn)
+        bottom = self.bottom_color()
         fx = int(event.x // SQUARE)
         fy = int(event.y // SQUARE)
         if not (0 <= fx < 8 and 0 <= fy < 8):
             return
 
-        if orient == chess.WHITE:
+        if bottom == chess.WHITE:
             file, rank = fx, 7 - fy
         else:
             file, rank = 7 - fx, fy
@@ -289,7 +307,9 @@ class App(tk.Tk):
         sq = chess.square(file, rank)
 
         if self._sel is None:
-            if self.board.piece_at(sq):
+            # Only allow selecting a piece of the side to move
+            piece = self.board.piece_at(sq)
+            if piece and piece.color == self.board.turn:
                 self._sel = sq
         else:
             mv = chess.Move(self._sel, sq)
@@ -301,7 +321,7 @@ class App(tk.Tk):
             else:
                 messagebox.showwarning("Illegal", "That move isn't legal.")
 
-    # ===== Best-move preview (non-destructive) ===================
+    # ---------- Best move (non-destructive preview) ----------
     def preview_best(self):
         self.status.config(text="Thinking…")
         threading.Thread(target=self._worker_best, daemon=True).start()
@@ -315,7 +335,7 @@ class App(tk.Tk):
 
     def _finish_best(self, brd, best, info):
         self.redraw(board=brd, highlight=best)
-        pov_is_white = (self.my_side(self.board.turn) == chess.WHITE)  # preview from current POV
+        pov_is_white = (self.board.turn == chess.BLACK)  # preview: the mover's POV
         cp = score_cp_signed(info["score"], pov_is_white)
         my_prob = win_prob(cp); opp_prob = 100 - my_prob
         self.eval_lbl.config(
@@ -323,7 +343,7 @@ class App(tk.Tk):
         )
         self.status.config(text="Preview – actual board unchanged (Reset to clear)")
 
-    # ===== Evaluate SAN ==========================================
+    # ---------- SAN entry ----------
     def eval_san(self):
         san = self.move_var.get().strip()
         if not san:
@@ -336,7 +356,7 @@ class App(tk.Tk):
         self.redraw()
         self.async_eval()
 
-    # ===== cleanup ===============================================
+    # ---------- Cleanup ----------
     def destroy(self):
         try:
             if hasattr(self, "engine"):
