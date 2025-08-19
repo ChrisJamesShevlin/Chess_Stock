@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 """
-Stockfish FEN analyser + Rating-Aware Style Coach
+Stockfish FEN analyser + Rating-Aware Style Coach (expanded bottom commentary)
 
-What you get:
-- Enter YOUR Elo; coach plays ~ Elo+200 (learn-by-challenge).
-- Blue arrow = Coach suggestion (your turn only), Orange = Best move preview.
+- Enter YOUR Elo; coach plays about Elo+200 (learn-by-challenge).
 - Styles: Defensive / Normal / Aggressive (biases ranking).
-- Rating model: samples among good moves using temperature + max safe eval drop
-  derived from target Elo; small “mistake chance” for realism.
-- Mate override (always take mate-in-N).
-- Variety: MultiPV + per-move probe (searchmoves) when needed.
-- Promotion dialog, stable POV eval, stale-result guards.
-- Fullscreen toggle (button or F11; Esc exits).
-- Engine access serialized & conservative defaults to avoid crashes.
+- Blue arrow = coach suggestion (only when it’s YOUR turn).
+- Orange = “Best move” preview (temporary, non-destructive).
+- Bottom status bar now shows detailed coach commentary:
+    Move | Idea | Style + Coach Elo | Safety vs best (dcp, dwin%) | Source
+- Coach mode checkbox truly disables/enables coaching (no compute, no arrow).
+- Variety via MultiPV + per-move probe; mate override; situation-aware safety caps.
+- Rating-aware sampling (temperature, safe eval drop, small mistake chance).
+- Promotion dialog, fullscreen toggle, stable POV eval, thread-safe engine calls.
 
 Install:
     python -m pip install python-chess pillow cairosvg
@@ -25,13 +24,13 @@ from tkinter import ttk, messagebox, simpledialog
 from PIL import Image, ImageTk
 import chess, chess.engine, chess.svg, cairosvg
 
-# ---------- Config ----------
-DEPTH = 16          # main analysis depth (MultiPV)
-MULTIPV = 8         # ask for several lines for variety
+# ---------- Base Config ----------
+DEPTH = 16          # main analysis depth ceiling
+MULTIPV = 8         # number of engine lines (upper bound)
 
-# Per-move probe (used when MultiPV doesn't give enough distinct first moves)
-PER_MOVE_DEPTH = 7   # shallow, fast
-MAX_PROBE_MOVES = 6  # how many legal moves to evaluate individually
+# Per-move probe when MultiPV lacks variety
+PER_MOVE_DEPTH = 7
+MAX_PROBE_MOVES = 6
 
 BOARD_SIZE = 360
 SQUARE = BOARD_SIZE // 8
@@ -39,26 +38,21 @@ SQUARE = BOARD_SIZE // 8
 # Win% curve: ~+300cp ≈ 75%
 K_LOG = 0.004
 
-# Style safety caps: how far we may deviate from engine #1 (caps on Δcp and Δwin%)
+# Style safety caps (Δcp, Δwin%) — keep suggestions safe
 ADHERENCE = {
-    "Aggressive": (140, 9.0),
-    "Normal":     (30,  3.0),
-    "Defensive":  (20,  2.0),
+    "Aggressive": (180, 12.0),
+    "Normal":     (45,   4.0),
+    "Defensive":  (25,   2.5),
 }
 
-# Style bias (in cp) per "style point" when re-ranking candidates (bigger = bolder)
 STYLE_CP_BONUS = {"Aggressive": 60, "Defensive": 40}
-
-# If an alternative move is within this many cp of engine #1,
-# prefer the one that fits the style better.
 DIVERSITY_MARGIN_CP = 60
 
 # ---------- Rating model ----------
-# We map target Elo -> (temperature_cp, max_drop_cp, mistake_prob, top_k_floor)
-# Interpolate between these anchors.
+# Map target Elo -> (temperature_cp, max_drop_cp, mistake_prob, top_k_floor)
 ELO_ANCHORS = [
     (800,  (110.0, 110, 0.22, 5)),
-    (1000, (95.0,   90, 0.18, 4)),
+    (1000, (120.0, 110, 0.25, 4)),
     (1200, (80.0,   70, 0.14, 4)),
     (1400, (62.0,   55, 0.11, 3)),
     (1600, (48.0,   45, 0.08, 3)),
@@ -69,6 +63,13 @@ ELO_ANCHORS = [
     (2600, (10.0,   10, 0.01, 2)),
 ]
 
+# ---------- ASCII-only status helpers ----------
+ASCII_STATUS = True
+_ASCII_MAP = str.maketrans({"—": "-", "–": "-", "Δ": "d", "≤": "<=", "≥": ">=", "≈": "~"})
+def _ascii(s: str) -> str: return s.translate(_ASCII_MAP)
+def set_status(widget, s: str): widget.config(text=_ascii(s) if ASCII_STATUS else s)
+
+# ---------- Small math / conversions ----------
 def win_prob(cp_signed: int) -> float:
     return 100.0 / (1.0 + math.exp(-K_LOG * cp_signed))
 
@@ -107,7 +108,6 @@ def find_stockfish_path() -> Optional[str]:
 def lerp(a, b, t): return a + (b - a) * t
 
 def rating_profile(target_elo: int):
-    """Interpolate (temp_cp, max_drop_cp, mistake_prob, top_k) from anchors."""
     xs = [e for e, _ in ELO_ANCHORS]
     target = max(min(target_elo, xs[-1]), xs[0])
     for i in range(len(xs) - 1):
@@ -120,21 +120,30 @@ def rating_profile(target_elo: int):
             misp = lerp(p0[2], p1[2], t)
             topk = int(round(lerp(p0[3], p1[3], t)))
             return float(temp), int(drop), float(misp), max(2, int(topk))
-    # Fallback
     return 20.0, 20, 0.03, 2
+
+def depth_profile(target_elo: int) -> Tuple[int, int, int]:
+    if target_elo < 1000:  return (9, 6, 5)
+    if target_elo < 1200:  return (10, 6, 6)
+    if target_elo < 1500:  return (12, 8, 7)
+    if target_elo < 1800:  return (14, 8, 7)
+    return (16, 8, 7)
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Stockfish FEN analyser + Rating-Aware Style Coach")
-        self.geometry("1100x820")
+        self.geometry("1100x840")
         self.resizable(True, True)
 
-        # --- Fullscreen bindings ---
+        # Fullscreen bindings
         self.is_fullscreen = False
         self.prev_geometry = None
         self.bind("<F11>", lambda e: self.toggle_fullscreen())
         self.bind("<Escape>", lambda e: self.exit_fullscreen())
+
+        # Early default to avoid race
+        self.target_elo = 1000
 
         # FEN input
         ttk.Label(self, text="Paste a FEN string:").pack(anchor="w", padx=10, pady=(10, 2))
@@ -147,17 +156,17 @@ class App(tk.Tk):
         ctl = ttk.Frame(self); ctl.pack(anchor="w", padx=10, pady=(6, 0))
         self.coach_on = tk.BooleanVar(value=True)
         ttk.Checkbutton(ctl, text="Coach mode", variable=self.coach_on,
-                        command=self.redraw).pack(side="left", padx=(0, 10))
+                        command=self.on_coach_toggle).pack(side="left", padx=(0, 10))
 
         ttk.Label(ctl, text="Style:").pack(side="left")
         self.style_var = tk.StringVar(value="Normal")
-        style_cb = ttk.Combobox(
+        self.style_cb = ttk.Combobox(
             ctl, textvariable=self.style_var,
             values=["Defensive", "Normal", "Aggressive"],
             state="readonly", width=12
         )
-        style_cb.pack(side="left", padx=(4, 12))
-        style_cb.bind("<<ComboboxSelected>>", lambda _e: self.update_style_preview())
+        self.style_cb.pack(side="left", padx=(4, 12))
+        self.style_cb.bind("<<ComboboxSelected>>", lambda _e: self.update_style_preview())
 
         # Rating row
         rating_fr = ttk.Frame(self); rating_fr.pack(anchor="w", padx=10, pady=(6, 0))
@@ -205,7 +214,7 @@ class App(tk.Tk):
         self._img = None
         self._sel = None
 
-        # Status bar (also shows "why" text for the coach suggestion)
+        # Status bar (detailed commentary printed here)
         self.status = ttk.Label(self, text="", relief="sunken", anchor="w")
         self.status.pack(side="bottom", fill="x")
 
@@ -218,7 +227,6 @@ class App(tk.Tk):
             self.destroy(); return
         try:
             self.engine = chess.engine.SimpleEngine.popen_uci(path)
-            # Conservative defaults to keep VMs/notebooks stable
             self.engine.configure({"Threads": 1, "Hash": 128})
             self.engine_lock = threading.Lock()
         except Exception as e:
@@ -236,13 +244,12 @@ class App(tk.Tk):
         self.style_sugg_move: Optional[chess.Move] = None
         self.style_sugg_reason: str = ""
         self.last_eval_fen: Optional[str] = None
-        self.eval_gen: int = 0  # increases with each async_eval call
 
         # Eval threading throttle
         self.eval_running = False
         self.latest_request = 0
 
-        # Apply initial color & Elo selection
+        # Apply initial selections
         self.on_pick_color()
         self.on_elo_change()
 
@@ -295,16 +302,14 @@ class App(tk.Tk):
         return self.play_color.get() == "white"
 
     def _invalidate_after_board_change(self):
-        """Clear cached analysis/suggestion when the position changes."""
         self.last_infos = None
         self.permove_cache = {}
         self.last_eval_fen = None
         self.style_sugg_move = None
         self.style_sugg_reason = ""
-        self.status.config(text="Thinking…")
+        set_status(self.status, "Thinking...")
 
     def on_elo_change(self):
-        # Parse user Elo and set target Elo
         try:
             user_elo = max(200, min(3000, int(self.user_elo_var.get())))
         except Exception:
@@ -312,17 +317,33 @@ class App(tk.Tk):
             self.user_elo_var.set("800")
         self.target_elo = max(600, min(2600, user_elo + 200))
         self.target_elo_lbl.config(text=f"Coach plays at: {self.target_elo}")
-        # Optional: try to set engine-limited strength if supported (won't hurt if ignored)
         try:
             with self.engine_lock:
                 self.engine.configure({"UCI_LimitStrength": True, "UCI_Elo": int(self.target_elo)})
         except Exception:
             pass
-        # Re-rank suggestion quickly using cache if position unchanged
         if self.last_eval_fen == self.board.fen():
             self.refresh_style_from_cache()
         else:
             self.async_eval()
+
+    # ---------- Coach toggle ----------
+    def on_coach_toggle(self):
+        if self.coach_on.get():
+            try: self.style_cb.config(state="readonly")
+            except Exception: pass
+            set_status(self.status, "Thinking...")
+            if self.last_eval_fen == self.board.fen():
+                self.refresh_style_from_cache()
+            else:
+                self.async_eval()
+        else:
+            try: self.style_cb.config(state="disabled")
+            except Exception: pass
+            self.style_sugg_move = None
+            self.style_sugg_reason = ""
+            set_status(self.status, "Coach off")
+            self.redraw()
 
     # ---------- Orientation helpers ----------
     def bottom_color(self) -> chess.Color:
@@ -350,28 +371,21 @@ class App(tk.Tk):
             board = self.board
 
         arrows = []
-
-        # Coach arrow (blue) – only when it's *your* turn
         if self.coach_on.get() and self.style_sugg_move:
             my_turn = self.board.turn == (chess.WHITE if self.my_color_is_white() else chess.BLACK)
             if my_turn:
                 arrows.append(chess.svg.Arrow(
                     self.style_sugg_move.from_square,
                     self.style_sugg_move.to_square,
-                    color="#3b82f6"  # blue
+                    color="#3b82f6"
                 ))
-
-        # Best-move preview arrow (orange), when preview is showing a temp board
         if highlight:
             arrows.append(chess.svg.Arrow(
-                highlight.from_square, highlight.to_square, color="#f59e0b"  # orange
+                highlight.from_square, highlight.to_square, color="#f59e0b"
             ))
 
         svg = chess.svg.board(
-            board=board,
-            size=BOARD_SIZE,
-            orientation=self.bottom_color(),
-            arrows=arrows
+            board=board, size=BOARD_SIZE, orientation=self.bottom_color(), arrows=arrows
         )
         png = cairosvg.svg2png(bytestring=svg.encode())
         self._img = ImageTk.PhotoImage(Image.open(io.BytesIO(png)))
@@ -384,87 +398,83 @@ class App(tk.Tk):
             return
         self.eval_running = True
         gen = self.latest_request
-        brd = self.board.copy()  # snapshot position for this call
-        self.status.config(text="Thinking…")
+        brd = self.board.copy()
+        set_status(self.status, "Thinking...")
         threading.Thread(target=self._worker_eval, args=(gen, brd), daemon=True).start()
 
     def _worker_eval(self, gen: int, brd: chess.Board):
-        # 1) MultiPV batch
-        info_list = self._safe_analyse(
-            brd,
-            chess.engine.Limit(depth=DEPTH),
-            multipv=MULTIPV
-        )
+        try:
+            pick_depth, mpv, probe_depth = depth_profile(self.target_elo)
+            pick_depth = min(pick_depth, DEPTH)
+            mpv = min(mpv, MULTIPV)
 
-        # Distinct first moves from MultiPV
-        unique_moves = []
-        seen = set()
-        for inf in info_list:
-            pv = inf.get("pv")
-            if not pv:
-                continue
-            mv = pv[0]
-            if mv not in seen:
-                seen.add(mv)
-                unique_moves.append(mv)
+            info_list = self._safe_analyse(brd, chess.engine.Limit(depth=pick_depth), multipv=mpv)
 
-        # 2) Per-move probe if variety is low OR legal moves are few
-        permove_scores: Dict[str, chess.engine.PovScore] = {}
-        try_probe = (len(unique_moves) < 2)
-        legals = list(brd.legal_moves)
+            unique_moves = []
+            seen = set()
+            for inf in info_list:
+                pv = inf.get("pv")
+                if not pv: continue
+                mv = pv[0]
+                if mv not in seen:
+                    seen.add(mv)
+                    unique_moves.append(mv)
 
-        if try_probe and legals:
-            def quick_priority(b: chess.Board, mv: chess.Move) -> float:
-                piece = b.piece_at(mv.from_square)
-                to_piece = b.piece_at(mv.to_square)
-                is_cap = (to_piece is not None) or b.is_en_passant(mv)
-                is_promo = mv.promotion is not None
-                gives_chk = b.gives_check(mv)
-                castle = b.is_castling(mv)
-                def center_w(sq: int) -> float:
-                    f = chess.square_file(sq); r = chess.square_rank(sq)
-                    return -((f-3.5)**2 + (r-3.5)**2)
-                center_gain = 0.0
-                if piece:
-                    center_gain = center_w(mv.to_square) - center_w(mv.from_square)
-                pawn_thrust = 0.0
-                if piece and piece.piece_type == chess.PAWN and not is_cap:
-                    delta = abs(chess.square_rank(mv.to_square) - chess.square_rank(mv.from_square))
-                    pawn_thrust = float(delta)
-                dev = 0.0
-                if piece and piece.piece_type in (chess.KNIGHT, chess.BISHOP):
-                    if chess.square_rank(mv.from_square) in (0, 7):
-                        dev = 1.0
-                return (4.0 * gives_chk
-                        + 3.0 * castle
-                        + 3.0 * (is_cap or is_promo)
-                        + 1.5 * max(0.0, center_gain)
-                        + 1.2 * dev
-                        + 1.0 * pawn_thrust)
+            permove_scores: Dict[str, chess.engine.PovScore] = {}
+            try_probe = (len(unique_moves) < 2)
+            legals = list(brd.legal_moves)
 
-            legals_sorted = sorted(legals, key=lambda m: quick_priority(brd, m), reverse=True)
-            probe_moves: List[chess.Move] = []
-            mv_set = set(unique_moves)
-            for mv in legals_sorted:
-                if mv not in mv_set:
-                    probe_moves.append(mv)
-                if len(probe_moves) >= MAX_PROBE_MOVES:
-                    break
+            if try_probe and legals:
+                def quick_priority(b: chess.Board, mv: chess.Move) -> float:
+                    piece = b.piece_at(mv.from_square)
+                    to_piece = b.piece_at(mv.to_square)
+                    is_cap = (to_piece is not None) or b.is_en_passant(mv)
+                    is_promo = mv.promotion is not None
+                    gives_chk = b.gives_check(mv)
+                    castle = b.is_castling(mv)
+                    def center_w(sq: int) -> float:
+                        f = chess.square_file(sq); r = chess.square_rank(sq)
+                        return -((f-3.5)**2 + (r-3.5)**2)
+                    center_gain = 0.0
+                    if piece:
+                        center_gain = center_w(mv.to_square) - center_w(mv.from_square)
+                    pawn_thrust = 0.0
+                    if piece and piece.piece_type == chess.PAWN and not is_cap:
+                        delta = abs(chess.square_rank(mv.to_square) - chess.square_rank(mv.from_square))
+                        pawn_thrust = float(delta)
+                    dev = 0.0
+                    if piece and piece.piece_type in (chess.KNIGHT, chess.BISHOP):
+                        if chess.square_rank(mv.from_square) in (0, 7):
+                            dev = 1.0
+                    return (4.0 * gives_chk + 3.0 * castle + 3.0 * (is_cap or is_promo)
+                            + 1.5 * max(0.0, center_gain) + 1.2 * dev + 1.0 * pawn_thrust)
 
-            for mv in probe_moves:
-                info = self._safe_analyse(
-                    brd,
-                    chess.engine.Limit(depth=PER_MOVE_DEPTH),
-                    searchmoves=[mv]
-                )
-                if "score" in info:
-                    permove_scores[mv.uci()] = info["score"]
+                legals_sorted = sorted(legals, key=lambda m: quick_priority(brd, m), reverse=True)
+                probe_moves: List[chess.Move] = []
+                mv_set = set(unique_moves)
+                for mv in legals_sorted:
+                    if mv not in mv_set:
+                        probe_moves.append(mv)
+                    if len(probe_moves) >= MAX_PROBE_MOVES:
+                        break
 
-        # Return results to UI thread
-        self.after(0, self._finish_eval, gen, brd.fen(), info_list, permove_scores)
+                for mv in probe_moves:
+                    info = self._safe_analyse(
+                        brd,
+                        chess.engine.Limit(depth=min(probe_depth, PER_MOVE_DEPTH)),
+                        searchmoves=[mv]
+                    )
+                    if "score" in info:
+                        permove_scores[mv.uci()] = info["score"]
 
-    def _finish_eval(self, gen: int, fen: str, info_list: list, permove_scores: Dict[str, chess.engine.PovScore]):
-        # Drop late/stale results
+            self.after(0, self._finish_eval, gen, brd.fen(), info_list, permove_scores)
+
+        except Exception as e:
+            self.after(0, lambda: set_status(self.status, f"Engine error: {e}"))
+            self.eval_running = False
+
+    def _finish_eval(self, gen: int, fen: str, info_list: list,
+                     permove_scores: Dict[str, chess.engine.PovScore]):
         if gen != self.latest_request or fen != self.board.fen():
             self.eval_running = False
             if self.latest_request > gen:
@@ -475,17 +485,14 @@ class App(tk.Tk):
         self.permove_cache = permove_scores
         self.last_eval_fen = fen
 
-        # Eval label uses *your* POV (stable)
         pov_is_white = self.my_color_is_white()
         top = info_list[0] if info_list else None
         cp = score_cp_signed(top["score"], pov_is_white) if top else 0
         self.show_eval(cp)
 
-        # Update the coach suggestion
         self.apply_rating_aware_pick()
         self.redraw()
 
-        # allow next eval
         self.eval_running = False
         if self.latest_request > gen:
             self.async_eval()
@@ -494,7 +501,7 @@ class App(tk.Tk):
         my_prob = win_prob(cp_signed)
         opp_prob = 100.0 - my_prob
         self.eval_lbl.config(
-            text=f"Eval: {fmt_cp(cp_signed)}  |  Win% Me:{my_prob:.0f} – Opp:{opp_prob:.0f}  (d{DEPTH})"
+            text=f"Eval: {fmt_cp(cp_signed)}  |  Win% Me:{my_prob:.0f} - Opp:{opp_prob:.0f}"
         )
 
     # ---------- UI actions ----------
@@ -524,10 +531,8 @@ class App(tk.Tk):
         piece = self.board.piece_at(from_sq)
         if piece and piece.piece_type == chess.PAWN:
             to_rank = chess.square_rank(to_sq)
-            if to_rank in (0, 7):  # promotion
-                ans = simpledialog.askstring(
-                    "Promotion", "Promote to (q, r, b, n)?", parent=self
-                )
+            if to_rank in (0, 7):
+                ans = simpledialog.askstring("Promotion", "Promote to (q, r, b, n)?", parent=self)
                 promo_map = {"q": chess.QUEEN, "r": chess.ROOK, "b": chess.BISHOP, "n": chess.KNIGHT}
                 promo = promo_map.get((ans or "q").lower()[0], chess.QUEEN)
                 return chess.Move(from_sq, to_sq, promotion=promo)
@@ -539,12 +544,10 @@ class App(tk.Tk):
         fy = int(event.y // SQUARE)
         if not (0 <= fx < 8 and 0 <= fy < 8):
             return
-
         if bottom == chess.WHITE:
             file, rank = fx, 7 - fy
         else:
             file, rank = 7 - fx, fy
-
         sq = chess.square(file, rank)
 
         if self._sel is None:
@@ -564,15 +567,19 @@ class App(tk.Tk):
 
     # Best move (non-destructive preview)
     def preview_best(self):
-        self.status.config(text="Thinking…")
+        set_status(self.status, "Thinking...")
         threading.Thread(target=self._worker_best, daemon=True).start()
 
     def _worker_best(self):
-        info = self._safe_analyse(self.board, chess.engine.Limit(depth=DEPTH))
-        best = info["pv"][0]
-        brd = self.board.copy()
-        brd.push(best)
-        self.after(0, self._finish_best, brd, best, info)
+        try:
+            pick_depth, _, _ = depth_profile(self.target_elo)
+            info = self._safe_analyse(self.board, chess.engine.Limit(depth=pick_depth))
+            best = info["pv"][0]
+            brd = self.board.copy()
+            brd.push(best)
+            self.after(0, self._finish_best, brd, best, info)
+        except Exception as e:
+            self.after(0, lambda: set_status(self.status, f"Engine error: {e}"))
 
     def _finish_best(self, brd, best, info):
         self.redraw(board=brd, highlight=best)
@@ -580,44 +587,21 @@ class App(tk.Tk):
         cp = score_cp_signed(info["score"], pov_is_white)
         my_prob = win_prob(cp); opp_prob = 100 - my_prob
         self.eval_lbl.config(
-            text=f"Best: {self.board.san(best):6} | {fmt_cp(cp)} | Win% Me:{my_prob:.0f} – Opp:{opp_prob:.0f}  (d{DEPTH})"
+            text=f"Best: {self.board.san(best):6} | {fmt_cp(cp)} | Win% Me:{my_prob:.0f} - Opp:{opp_prob:.0f}"
         )
-        self.status.config(text="Preview – actual board unchanged (Reset to clear)")
+        set_status(self.status, "Preview - actual board unchanged (Reset to clear)")
 
-    # ---------- Rating + Style pick ----------
-    def update_style_preview(self):
-        if self.last_eval_fen != self.board.fen():
-            self.async_eval()
-        else:
-            self.refresh_style_from_cache()
-
-    def refresh_style_from_cache(self):
-        self.apply_rating_aware_pick()
-        self.redraw()
-
-    def apply_rating_aware_pick(self):
-        mv, reason = self.pick_rating_style_move()
-        self.style_sugg_move = mv
-        self.style_sugg_reason = reason
-        my_turn = self.board.turn == (chess.WHITE if self.my_color_is_white() else chess.BLACK)
-        if mv and my_turn:
-            try: san = self.board.san(mv)
-            except Exception: san = str(mv)
-            self.status.config(text=f"{san}  —  {reason}")
-        else:
-            self.status.config(text="Ready")
-
+    # ---------- Style / Reasons ----------
     def _style_features(self, board: chess.Board, move: chess.Move) -> dict:
-        b = board
-        mv = move
+        b = board; mv = move
         moved_piece = b.piece_at(mv.from_square)
         to_piece = b.piece_at(mv.to_square)
         is_capture = to_piece is not None or b.is_en_passant(mv)
         is_promo = mv.promotion is not None
         gives_check = b.gives_check(mv)
         def center_weight(sq: int) -> float:
-            file = chess.square_file(sq); rank = chess.square_rank(sq)
-            return -((file-3.5)**2 + (rank-3.5)**2)
+            f = chess.square_file(sq); r = chess.square_rank(sq)
+            return -((f-3.5)**2 + (r-3.5)**2)
         center_gain = 0.0
         if moved_piece:
             center_gain = center_weight(mv.to_square) - center_weight(mv.from_square)
@@ -627,15 +611,13 @@ class App(tk.Tk):
                 dev_new_piece = 1
         pawn_thrust = 0
         if moved_piece and moved_piece.piece_type == chess.PAWN and not is_capture:
-            delta = abs(chess.square_rank(mv.to_square) - chess.square_rank(mv.from_square))
-            pawn_thrust = delta
+            pawn_thrust = abs(chess.square_rank(mv.to_square) - chess.square_rank(mv.from_square))
         castle = b.is_castling(mv)
         quiet_dev = int((not is_capture) and moved_piece and moved_piece.piece_type in (chess.KNIGHT, chess.BISHOP))
         king_shelter_pawn = 0
         if moved_piece and moved_piece.piece_type == chess.PAWN and not is_capture:
             file = chess.square_file(mv.from_square)
-            if file in (0, 7):  # a/h pawns
-                king_shelter_pawn = 1
+            if file in (0, 7): king_shelter_pawn = 1
         simplify_capture = 0
         if is_capture and moved_piece and to_piece:
             simplify_capture = int(moved_piece.piece_type == to_piece.piece_type)
@@ -650,6 +632,26 @@ class App(tk.Tk):
             "king_shelter_pawn": king_shelter_pawn,
             "simplify_capture": simplify_capture,
         }
+
+    def _reason_bits(self, style: str, f: dict) -> List[str]:
+        bits: List[str] = []
+        if style == "Aggressive":
+            if f["is_check"]:                bits.append("give check")
+            if f["is_capture_or_promo"]:     bits.append("win material/promote")
+            if f["center_gain"] > 0.0:       bits.append("take center space")
+            if f["dev_new_piece"]:           bits.append("develop new piece")
+            if f["pawn_thrust"] >= 2:        bits.append("two-square pawn thrust")
+            elif f["pawn_thrust"] == 1:      bits.append("pawn thrust")
+        elif style == "Defensive":
+            if f["castle"]:                  bits.append("castle for king safety")
+            if f["quiet_dev"]:               bits.append("quiet development")
+            if f["king_shelter_pawn"]:       bits.append("improve king shelter")
+            if f["simplify_capture"]:        bits.append("simplify by trade")
+            if f["is_check"] == 0 and f["is_capture_or_promo"] == 0:
+                                            bits.append("avoid forcing moves")
+        else:
+            bits.append("best engine move")
+        return bits
 
     def _style_metric(self, style: str, f: dict) -> float:
         if style == "Aggressive":
@@ -666,119 +668,150 @@ class App(tk.Tk):
                     + (0.8 if (f["is_check"] == 0 and f["is_capture_or_promo"] == 0) else 0.0))
         return 0.0
 
-    def pick_rating_style_move(self) -> Tuple[Optional[chess.Move], str]:
-        """Choose among candidates using (a) engine evals, (b) style bias, (c) rating-based sampling."""
+    # ---------- Picking + bottom commentary ----------
+    def update_style_preview(self):
+        if self.last_eval_fen != self.board.fen():
+            self.async_eval()
+        else:
+            self.refresh_style_from_cache()
+
+    def refresh_style_from_cache(self):
+        self.apply_rating_aware_pick()
+        self.redraw()
+
+    def apply_rating_aware_pick(self):
+        if not self.coach_on.get():
+            self.style_sugg_move = None
+            self.style_sugg_reason = ""
+            set_status(self.status, "")
+            return
+
+        mv, reason, meta = self.pick_rating_style_move()
+        self.style_sugg_move = mv
+        self.style_sugg_reason = reason
+
+        my_turn = self.board.turn == (chess.WHITE if self.my_color_is_white() else chess.BLACK)
+        if mv and my_turn:
+            # Build detailed one-line commentary for the status bar
+            try: san = self.board.san(mv)
+            except Exception: san = mv.uci()
+
+            feats = self._style_features(self.board, mv)
+            idea = ", ".join(self._reason_bits(self.style_var.get(), feats)[:3]) or "on plan"
+
+            top_cp = meta.get("top_cp", 0.0)
+            pick_cp = meta.get("pick_cp", top_cp)
+            dcp = int(top_cp - pick_cp)
+            dwp = win_prob(top_cp) - win_prob(pick_cp)
+            src = meta.get("source", "pv")
+
+            msg = (f"Move: {san} | Idea: {idea} | Style:{self.style_var.get()} "
+                   f"| CoachElo:{self.target_elo} | Safety d{dcp}cp d{dwp:.1f}% | Src:{src}")
+            set_status(self.status, msg)
+        else:
+            set_status(self.status, "Waiting for opponent...")
+
+    def pick_rating_style_move(self) -> Tuple[Optional[chess.Move], str, Dict[str, float]]:
+        """Choose move with style + rating sampling. Returns (move, reason, meta) where
+           meta contains top_cp, pick_cp, source."""
         style = self.style_var.get()
         pov_is_white = self.my_color_is_white()
 
-        # Build candidates from MultiPV (unique first moves)
         cands: List[Tuple[chess.Move, float, dict, List[str], Optional[int], float, str]] = []
         seen = set()
         if self.last_infos:
             for inf in self.last_infos:
                 pv = inf.get("pv")
-                if not pv:
-                    continue
+                if not pv: continue
                 mv = pv[0]
-                if mv in seen:
-                    continue
+                if mv in seen: continue
                 seen.add(mv)
                 cp = score_cp_signed(inf["score"], pov_is_white)
                 feats = self._style_features(self.board, mv)
+                reasons = self._reason_bits(style, feats)
                 metric = self._style_metric(style, feats)
                 m_in = mate_in(inf["score"], pov_is_white)
-                cands.append((mv, float(cp), feats, [], m_in, metric, "pv"))
+                cands.append((mv, float(cp), feats, reasons, m_in, metric, "pv"))
 
-        # Augment with per-move probe (already computed async)
         for uci, sc in self.permove_cache.items():
             mv = chess.Move.from_uci(uci)
-            if mv in seen:
-                continue
+            if mv in seen: continue
             cp = score_cp_signed(sc, pov_is_white)
             feats = self._style_features(self.board, mv)
+            reasons = self._reason_bits(style, feats)
             metric = self._style_metric(style, feats)
             m_in = mate_in(sc, pov_is_white)
-            cands.append((mv, float(cp), feats, [], m_in, metric, "probe"))
+            cands.append((mv, float(cp), feats, reasons, m_in, metric, "probe"))
 
         if not cands:
-            return None, ""
+            return None, "", {}
 
-        # Mate override
         mates = [t for t in cands if t[4] is not None and t[4] > 0]
         if mates:
             best = min(mates, key=lambda t: t[4])
-            return best[0], f"mate in {best[4]}"
+            meta = {"top_cp": best[1], "pick_cp": best[1], "source": "mate"}
+            return best[0], f"finish tactic: mate in {best[4]}", meta
 
-        # Engine top eval
         top_cp = max(t[1] for t in cands)
         top_mv = max(cands, key=lambda t: t[1])[0]
 
-        # Style "push": small cp bonus to on-style moves (doesn't override rating logic)
         style_bonus = STYLE_CP_BONUS.get(style, 0)
-
-        # Rating profile
         temp_cp, max_drop_cp, mistake_prob, top_k_floor = rating_profile(self.target_elo)
 
-        # Always keep some safety and adjust by game state
-        # If winning big, tighten; if worse, loosen slightly to allow chances.
         if top_cp >= 200:
-            max_drop_cp = int(max_drop_cp * 0.6)
-            temp_cp *= 0.85
+            max_drop_cp = int(max_drop_cp * 1.15); temp_cp *= 1.10
         elif top_cp <= -80:
-            max_drop_cp = int(max_drop_cp * 1.25)
-            temp_cp *= 1.10
+            max_drop_cp = int(max_drop_cp * 1.35); temp_cp *= 1.15
 
-        # Pool A: safe candidates within drop cap (and at least top_k_floor items if possible)
         sorted_cands = sorted(cands, key=lambda t: t[1], reverse=True)
         poolA = [t for t in sorted_cands if (top_cp - t[1]) <= max_drop_cp]
         if len(poolA) < top_k_floor:
             poolA = sorted_cands[:max(top_k_floor, len(sorted_cands))]
 
-        # Compute weights with temperature and style
         def weights(pool):
             w = []
-            for mv, cp, feats, _, _, metric, _ in pool:
-                # effective score = cp + style push
+            for _, cp, feats, _, _, metric, _ in pool:
                 eff = cp + style_bonus * metric
                 w.append(math.exp((eff - top_cp) / max(1e-9, temp_cp)))
             s = sum(w) or 1.0
             return [x / s for x in w]
 
-        # With a small probability, simulate a (controlled) mistake: widen pool and warm up
         use_mistake = (random.random() < mistake_prob)
         if use_mistake and len(sorted_cands) > len(poolA):
             widen = int(max_drop_cp * 1.8)
             poolB = [t for t in sorted_cands if (top_cp - t[1]) <= widen] or sorted_cands[:max(top_k_floor+1, 3)]
-            # increase temperature for mistake sampling
             old_temp = temp_cp
             temp_cp *= 1.4
             probs = weights(poolB)
             pick = random.choices(poolB, probs, k=1)[0]
             temp_cp = old_temp
-            reason = f"rating {self.target_elo}, (mistake), Δcap≤{widen}cp, τ≈{int(old_temp)}"
         else:
             probs = weights(poolA)
             pick = random.choices(poolA, probs, k=1)[0]
-            reason = f"rating {self.target_elo}, Δcap≤{max_drop_cp}cp, τ≈{int(temp_cp)}"
 
-        pick_mv, pick_cp = pick[0], pick[1]
+        pick_mv, pick_cp, _, pick_reasons, _, pick_metric, source = pick
 
-        # Global safety cap against crazy drops (and mate the wrong way)
         cap_cp, cap_wp = ADHERENCE.get(style, ADHERENCE["Normal"])
         drop_cp = top_cp - pick_cp
         drop_wp = win_prob(top_cp) - win_prob(pick_cp)
         if drop_cp > cap_cp or drop_wp > cap_wp:
-            return top_mv, f"engine safety (Δ{int(drop_cp)}cp, Δ{drop_wp:.1f}%)"
+            meta = {"top_cp": top_cp, "pick_cp": top_cp, "source": "safe-top"}
+            return top_mv, f"safer choice (saved {int(drop_cp)}cp, {drop_wp:.1f}% win prob)", meta
 
-        # Diversity nudge: if another move is close to engine #1 and more on-style, pick it
         alts = [t for t in cands if t[0] != pick_mv and (top_cp - t[1]) <= DIVERSITY_MARGIN_CP]
         if alts:
-            alt = max(alts, key=lambda t: t[5])  # highest style metric
-            if alt[5] > pick[5] + 1.0:
-                pick_mv = alt[0]
-                reason += "; within margin (style)"
+            alt = max(alts, key=lambda t: t[5])
+            if alt[5] > pick_metric + 1.0:
+                pick_mv, pick_reasons, source = alt[0], alt[3], alt[6]
+                # refresh cp for alt
+                for m, cpv, *_rest in cands:
+                    if m == pick_mv:
+                        pick_cp = cpv
+                        break
 
-        return pick_mv, reason
+        friendly = ", ".join(pick_reasons[:3]) if pick_reasons else "on plan"
+        meta = {"top_cp": top_cp, "pick_cp": pick_cp, "source": source}
+        return pick_mv, f"{friendly} (rating {self.target_elo}, cap {int(max_drop_cp)}cp, {source})", meta
 
     # ---------- Cleanup ----------
     def destroy(self):
