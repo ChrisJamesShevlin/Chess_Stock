@@ -2,7 +2,10 @@
 # -*- coding: utf-8 -*-
 """
 Stockfish FEN analyser + Rating-Aware Style Coach + Lichess Explorer Assist
-Now with Explorer 'Pool' selector and clearer status/diagnostics.
+- Explorer 'Pool' selector (All / Classical+Rapid / Blitz+Bullet / Correspondence only)
+- Robust Explorer requests (repeat 'speeds' params; retry without speeds on 400)
+- Status bar shows BookEV / Games / Draw% or 'no data' with pool name
+- Explorer status label shows how many moves were returned
 
 Install:
     python -m pip install python-chess pillow cairosvg requests
@@ -49,7 +52,7 @@ LICHESS_EXPLORER = "https://explorer.lichess.ovh/lichess"
 LICHESS_CLOUD_EVAL = "https://lichess.org/api/cloud-eval"
 
 _http = requests.Session()
-_http.headers.update({"User-Agent": "ICCF-Assistant/1.1 (+contact@example.com)"})
+_http.headers.update({"User-Agent": "ICCF-Assistant/1.2 (+contact@example.com)"})
 HTTP_TIMEOUT = 7.0
 
 _explorer_cache: Dict[str, dict] = {}
@@ -120,31 +123,56 @@ def depth_profile(target_elo: int) -> Tuple[int, int, int]:
     return (16, 8, 7)
 
 # ---------- Lichess Explorer helpers ----------
-def _pool_to_speeds(pool_choice: str) -> Optional[str]:
-    if pool_choice == "All": return None                  # widest pool (omit param)
-    if pool_choice == "Classical+Rapid": return "classical,rapid"
-    if pool_choice == "Blitz+Bullet":    return "blitz,bullet"
-    if pool_choice == "Correspondence only": return "correspondence"
-    return None
+def _pool_values(pool_choice: str):
+    if pool_choice == "All":
+        return ["classical", "rapid", "blitz", "bullet", "correspondence"]
+    if pool_choice == "Classical+Rapid":
+        return ["classical", "rapid"]
+    if pool_choice == "Blitz+Bullet":
+        return ["blitz", "bullet"]
+    if pool_choice == "Correspondence only":
+        return ["correspondence"]
+    return ["classical", "rapid", "blitz", "bullet", "correspondence"]
 
 def lichess_explorer(fen: str, top_moves: int = 12, pool_choice: str = "All") -> Optional[dict]:
+    """Explorer request with repeated 'speeds' params; retries without 'speeds' on HTTP 400."""
     cache_key = f"{fen}|{pool_choice}|{top_moves}"
     if cache_key in _explorer_cache:
         return _explorer_cache[cache_key]
-    params = {"fen": fen, "topGames": 0, "moves": top_moves, "variant": "standard", "since": 0}
-    speeds = _pool_to_speeds(pool_choice)
-    if speeds: params["speeds"] = speeds
+
+    # Build as list of tuples to repeat 'speeds'
+    params = [
+        ("fen", fen),
+        ("variant", "standard"),
+        ("moves", str(top_moves)),
+        ("topGames", "0"),
+    ]
+    for sp in _pool_values(pool_choice):
+        params.append(("speeds", sp))
+
     try:
         r = _http.get(LICHESS_EXPLORER, params=params, timeout=HTTP_TIMEOUT)
+        print(f"[Explorer] GET {r.url}")
         if r.ok:
             data = r.json()
             _explorer_cache[cache_key] = data
-            print(f"[Explorer] pool={pool_choice} moves={len(data.get('moves', []))} url={r.url}")
+            print(f"[Explorer] ok: {len(data.get('moves', []))} moves")
             return data
         else:
-            print(f"[Explorer] HTTP {r.status_code} pool={pool_choice}")
+            print(f"[Explorer] HTTP {r.status_code}. Retrying without 'speeds'…")
+            r2 = _http.get(LICHESS_EXPLORER,
+                           params={"fen": fen, "variant": "standard", "moves": top_moves, "topGames": 0},
+                           timeout=HTTP_TIMEOUT)
+            print(f"[Explorer] retry GET {r2.url}")
+            if r2.ok:
+                data = r2.json()
+                _explorer_cache[cache_key] = data
+                print(f"[Explorer] retry ok: {len(data.get('moves', []))} moves")
+                return data
+            else:
+                print(f"[Explorer] retry HTTP {r2.status_code}: {r2.text[:200]}")
     except Exception as e:
-        print(f"[Explorer] request failed: {e}")
+        print(f"[Explorer] request failed: {type(e).__name__}: {e}")
     return None
 
 def lichess_cloud_eval(fen: str, multi_pv: int = 5) -> Optional[dict]:
@@ -163,7 +191,7 @@ def lichess_cloud_eval(fen: str, multi_pv: int = 5) -> Optional[dict]:
     return None
 
 def explorer_bonus_for_move(move_uci: str, ex_data: dict, min_sample: int) -> Tuple[float, dict]:
-    if not ex_data or "moves" not in ex_data:  # no data
+    if not ex_data or "moves" not in ex_data:
         return 0.0, {"games": 0, "winP": 0.0, "drawP": 0.0, "avgElo": 0}
     for m in ex_data["moves"]:
         if m.get("uci") == move_uci:
@@ -173,7 +201,7 @@ def explorer_bonus_for_move(move_uci: str, ex_data: dict, min_sample: int) -> Tu
             w = float(m.get("white", 0)); d = float(m.get("draws", 0)); b = float(m.get("black", 0))
             total = max(1.0, w + d + b)
             winP = 100.0 * w / total; drawP = 100.0 * d / total
-            ev = (winP - 50.0) - 0.35 * (drawP - 30.0)          # cp-like EV (cap below)
+            ev = (winP - 50.0) - 0.35 * (drawP - 30.0)
             bonus = max(-60.0, min(60.0, ev))
             return bonus, {"games": games, "winP": winP, "drawP": drawP, "avgElo": avg}
     return 0.0, {"games": 0, "winP": 0.0, "drawP": 0.0, "avgElo": 0}
@@ -252,13 +280,15 @@ class App(tk.Tk):
         self.min_sample = tk.IntVar(value=100)
         ttk.Spinbox(assist_fr, from_=0, to=10000, width=6, textvariable=self.min_sample,
                     command=lambda: self.async_eval()).pack(side="left", padx=(6,8))
-        # NEW: Pool selector
         ttk.Label(assist_fr, text="Pool:").pack(side="left", padx=(12, 4))
         self.pool_var = tk.StringVar(value="All")
         pool_cb = ttk.Combobox(assist_fr, textvariable=self.pool_var, state="readonly", width=18,
                                values=["All","Classical+Rapid","Blitz+Bullet","Correspondence only"])
         pool_cb.pack(side="left")
         pool_cb.bind("<<ComboboxSelected>>", lambda _e: self.async_eval())
+        # Explorer status label
+        self.explorer_status = tk.StringVar(value="Explorer: —")
+        ttk.Label(assist_fr, textvariable=self.explorer_status).pack(side="left", padx=(12,0))
 
         # Buttons
         btn_fr = ttk.Frame(self); btn_fr.pack(pady=8)
@@ -426,7 +456,7 @@ class App(tk.Tk):
             # unique PV heads
             unique_moves, seen = [], set()
             for inf in info_list:
-                pv = inf.get("pv"); 
+                pv = inf.get("pv")
                 if not pv: continue
                 mv = pv[0]
                 if mv not in seen: seen.add(mv); unique_moves.append(mv)
@@ -471,6 +501,16 @@ class App(tk.Tk):
             return
         self.last_infos = info_list; self.permove_cache = permove_scores
         self.last_eval_fen = fen; self._last_explorer = ex_data; self._last_cloud = cloud
+
+        # Update Explorer status label
+        if self.use_explorer.get():
+            if ex_data and isinstance(ex_data, dict):
+                n = len(ex_data.get("moves", []))
+                self.explorer_status.set(f"Explorer: {n} moves")
+            else:
+                self.explorer_status.set("Explorer: no data / error")
+        else:
+            self.explorer_status.set("Explorer: off")
 
         pov_is_white = self.my_color_is_white()
         cp = score_cp_signed(info_list[0]["score"], pov_is_white) if info_list else 0
@@ -613,7 +653,6 @@ class App(tk.Tk):
             idea = ", ".join(self._reason_bits(self.style_var.get(), feats)[:3]) or "on plan"
             top_cp = meta.get("top_cp", 0.0); pick_cp = meta.get("pick_cp", top_cp)
             dcp = int(top_cp - pick_cp); dwp = win_prob(top_cp) - win_prob(pick_cp); src = meta.get("source", "pv")
-            # Explorer annotation (or explicit 'no data')
             ex_txt = ""
             if self.use_explorer.get():
                 exp = meta.get("explorer")
