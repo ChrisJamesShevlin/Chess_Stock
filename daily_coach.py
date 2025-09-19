@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Stockfish FEN analyser + Lichess Explorer Assist — No Arrows + Dual Eval Buckets
+Stockfish FEN analyser + Lichess Explorer Assist — No Arrows + Dual Eval Buckets + Undo
 
-Changes from your previous version:
-- ❌ Removed ALL arrows (no blue pick arrow, no orange preview arrow).
-- 🔄 Still updates after every move exactly as before.
-- 🔍 Displays **bucketed evaluations** instead of Win%: 
-    Winning / Slightly Better / Equal / Slightly Worse / Losing
-  for **you** and for **your opponent** simultaneously.
-- ✅ Keeps engine strength, depth, MultiPV, Explorer/Cloud toggles, etc.
-- 📝 Labels now avoid percent; cp values remain in some status lines (per your request).
+What’s in:
+- ❌ Removed ALL arrows (no blue/orange arrows anywhere).
+- 🔄 Updates after every move exactly as before.
+- 🧭 Buckets instead of %: shows **Me** and **Opponent** as one of
+  [Winning / Slightly Better / Equal / Slightly Worse / Losing].
+- ↩️ Added **Undo (Back)** button to revert the last move you made.
+- ✅ Keeps engine strength, MultiPV, Explorer/Cloud toggles, etc.
 
-Install (unchanged):
+Install:
     python -m pip install python-chess pillow cairosvg requests
     sudo apt install stockfish
 """
@@ -32,14 +31,14 @@ PER_MOVE_DEPTH = 7    # Quick probe for extra candidates
 MAX_PROBE_MOVES = 6
 BOARD_SIZE = 360
 SQUARE = BOARD_SIZE // 8
-K_LOG = 0.004  # used for internal win% curve (retained, but not displayed)
+K_LOG = 0.004  # kept for internal win% curve (not shown)
 
 # ---------- Lichess API ----------
 LICHESS_EXPLORER = "https://explorer.lichess.ovh/lichess"
 LICHESS_CLOUD_EVAL = "https://lichess.org/api/cloud-eval"
 
 _http = requests.Session()
-_http.headers.update({"User-Agent": "ICCF-Assistant/NoArrowsBuckets/1.0 (+contact@example.com)"})
+_http.headers.update({"User-Agent": "ICCF-Assistant/NoArrowsBucketsUndo/1.0 (+contact@example.com)"})
 HTTP_TIMEOUT = 7.0
 
 _explorer_cache: Dict[str, dict] = {}
@@ -49,13 +48,11 @@ _cloudeval_cache: Dict[str, dict] = {}
 ASCII_STATUS = True
 _ASCII_MAP = str.maketrans({"—": "-", "–": "-", "Δ": "d", "≤": "<=", "≥": ">=", "≈": "~"})
 def _ascii(s: str) -> str: return s.translate(_ASCII_MAP)
-def set_status(widget, s: str): widget.config(text=_ascii(s) if ASCII_STATUS else s)
+
+def set_status(widget, s: str):
+    widget.config(text=_ascii(s) if ASCII_STATUS else s)
 
 # ---------- Math & bucket helpers ----------
-def win_prob(cp_signed: int) -> float:
-    # kept for internal use if needed; not shown in UI now
-    return 100.0 / (1.0 + math.exp(-K_LOG * cp_signed))
-
 def fmt_cp(cp: int) -> str:
     return f"{cp/100:.2f}" if cp < 0 else f"+{cp/100:.2f}"
 
@@ -173,8 +170,8 @@ def explorer_bonus_for_move(move_uci: str, ex_data: dict, min_sample: int):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Stockfish (Max) + Lichess Explorer — Buckets, No Arrows")
-        self.geometry("1120x880"); self.resizable(True, True)
+        self.title("Stockfish (Max) + Lichess Explorer — Buckets, No Arrows, Undo")
+        self.geometry("1120x900"); self.resizable(True, True)
 
         # Fullscreen bindings
         self.is_fullscreen = False; self.prev_geometry = None
@@ -232,6 +229,7 @@ class App(tk.Tk):
         ttk.Button(btn_fr, text="Fullscreen", command=self.toggle_fullscreen).grid(row=0, column=2, padx=5)
         self.best_btn = ttk.Button(btn_fr, text="Best move (preview)", command=self.preview_best)
         self.best_btn.grid(row=0, column=3, padx=5)
+        ttk.Button(btn_fr, text="Undo (Back)", command=self.undo_move).grid(row=0, column=4, padx=5)
 
         # Eval label + board
         self.eval_lbl = ttk.Label(self, text="", font=("Courier New", 12)); self.eval_lbl.pack(pady=6)
@@ -268,6 +266,9 @@ class App(tk.Tk):
         self.eval_running = False; self.latest_request = 0
         self._last_explorer: Optional[dict] = None
         self._last_cloud: Optional[dict] = None
+
+        # Keybinds (optional): Ctrl+Z undo
+        self.bind_all("<Control-z>", lambda e: self.undo_move())
 
         # Kick off
         self.on_pick_color(); self.redraw(); self.async_eval()
@@ -324,9 +325,8 @@ class App(tk.Tk):
         self.fixed_bottom_is_white = not self.fixed_bottom_is_white; self.redraw()
 
     # ---------- Drawing (NO ARROWS) ----------
-    def redraw(self, board: Optional[chess.Board] = None, highlight: Optional[chess.Move] = None):
+    def redraw(self, board: Optional[chess.Board] = None):
         if board is None: board = self.board
-        # Intentionally no arrows; ignore highlight parameter
         svg = chess.svg.board(board=board, size=BOARD_SIZE, orientation=self.bottom_color())
         png = cairosvg.svg2png(bytestring=svg.encode())
         self._img = ImageTk.PhotoImage(Image.open(io.BytesIO(png)))
@@ -411,7 +411,7 @@ class App(tk.Tk):
         cp = score_cp_signed(info_list[0]["score"], pov_is_white) if info_list else 0
         self.show_eval_buckets(cp)
 
-        # Choose pick (engine cp + Explorer bias) — retained behavior
+        # Choose pick (engine cp + Explorer bias) — retained behavior (not visualized)
         self.apply_best_pick()
         self.redraw()
 
@@ -425,6 +425,13 @@ class App(tk.Tk):
         self.eval_lbl.config(text=f"Eval — Me: {me_b} | Opp: {opp_b}")
 
     # ---------- UI actions ----------
+    def undo_move(self):
+        if self.board.move_stack:
+            self.board.pop()
+            self.redraw(); self.async_eval()
+        else:
+            set_status(self.status, "Nothing to undo.")
+
     def load_fen(self):
         fen = self.fen_var.get().strip()
         if not fen: messagebox.showinfo("No FEN", "Paste a FEN first."); return
@@ -481,13 +488,12 @@ class App(tk.Tk):
             self.after(0, lambda: set_status(self.status, f"Engine error: {e}"))
 
     def _finish_best(self, brd, best, info):
-        # No arrow; just repaint the board state after best (preview), but keep actual board unchanged
-        # We'll still show cp (not %), removing the previous Win% display
+        # No arrows; just repaint preview board, keep actual board unchanged
         self.redraw(board=brd)
         cp = score_cp_signed(info["score"], self.my_color_is_white())
         set_status(self.status, f"Best preview: {self.board.san(best):6} | Eval: {fmt_cp(cp)} (board unchanged — Reset to clear preview)")
 
-    # ---------- Pick move: engine cp + Explorer bonus ----------
+    # ---------- Pick move: engine cp + Explorer bonus (not visualized) ----------
     def apply_best_pick(self):
         if not self.last_infos:
             set_status(self.status, "No engine data.")
@@ -537,7 +543,7 @@ class App(tk.Tk):
 
         best_list.sort(key=lambda x: x[0], reverse=True)
         total, pick, meta = best_list[0]
-        self.pick_move = pick  # retained, but NOT visualized by arrows
+        self.pick_move = pick  # retained (not visualized by arrows)
 
         # Status line (no arrows; keep cp textual)
         base_cp = int(meta["base_cp"])
@@ -564,4 +570,3 @@ class App(tk.Tk):
 # ---------- Main ----------
 if __name__ == "__main__":
     App().mainloop()
-
